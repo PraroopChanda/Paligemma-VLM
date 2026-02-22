@@ -162,8 +162,9 @@ class PaliGemmaProcessor:
             padding=padding,
             truncation=truncation
         )
-        ### generally we are not using any padding, so the mask would be all True , inputs as output would be input_ids (after tokenization) --> this would basically be a list [25600,25600, ..., 23,1,4,5]
-        ##, attention_mask , would be the one used in attention mechanism
+        ### generally we are not using any padding, so the mask would be all True, inputs as output would be input_ids [BATCH,SEQ_LEN] --> batch dimension is added because we output as pytorch tensors
+        # (after tokenization) --> this would basically be a list [25600,25600, ..., 23,1,4,5]
+        ##, attention_mask , would be the one used in attention mechanism [1,seq_len] would be shape of output [B,seq_len], where seq_len is number of tokens in the image_tokens+<BOS>+input_prompt (Tokenized)
 
         return_data={"pixel_values":pixel_values,**inputs}  ## **inputs basically just unpacks the key value pairs, masking it form key=value instead of key:value
         
