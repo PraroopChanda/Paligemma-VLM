@@ -69,7 +69,100 @@ class PaliGemmaConfig():
         self.text_config.num_image_tokens=(self.vision_config.image_size // self.vision_config.patch_size) ** 2   ## would be 256 in this case, patch size 14, image size 224*224
         self.vision_config.projection_dim=projection_dim
 
+class GemmaModel(nn.Module): ## this is the actual gemma model in sequence (embeddings + layers + post norm)
+    def __init__(self,config):
+        super().__init__()
+        self.config=config
+        self.padding_idx=config.pad_token_id
+        self.vocab_size=config.vocab_size
 
+        self.embed_token=nn.Embedding(self.vocab_size,config.hidden_size,self.padding_idx) ## padding index does not contribute to the gradient
+        self.layers=nn.ModuleList(
+            [GemmaDecoderLayer(config,layer_idx) for layer_idx in range(config.num_hidden_layers)] ## we also need to this layer idx to track the kv cache for each layer
+        )
+        self.norm=GemmaRMSNorm(config.hidden_size,eps=config.rms_norm_eps)
+
+    def get_input_embeddings(self):
+        return self.embed_token
+
+    def forward(
+            self,
+            attention_mask: Optional[torch.Tensor]=None,
+            position_ids: Optional[torch.LongTensor]=None,
+            input_embeds: Optional[torch.FloatTensor] =None,
+            kv_cache: Optional[KVCache]=None,
+        )->torch.FloatTensor:
+
+        hidden_states=input_embeds ## the input embeds to the model [B,seq_len,hidden_state]
+         # [Batch_Size, Seq_Len, Hidden_Size]
+        normalizer=torch.tensor(self.config.hidden_size**0.5,dtype=hidden_states.dtype)
+        hidden_states=hidden_states*normalizer
+
+        for decoder_layer in self.layers:
+            hidden_states=decoder_layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                kv_cache=kv_cache
+            )
+
+        hidden_states=self.norm(hidden_states) ##[B,seq_len, Hidden_size] --> This is post layer normalization before converting to logits
+
+        return hidden_states    
+
+
+class GemmaForCasualLM(nn.Module): ## this will contain all modules of Gemma model, including the last linear projection layer as well
+    def __init__(self,config):
+        super().__init__()
+        self.config=config
+        self.model=GemmaModel(config)
+        self.vocab_size=config.vocab_size
+        self.lm_head=nn.Linear(config.hidden_size,config.vocab_size,bias=False)
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def tie_weights(self):
+        self.lm_head.weight = self.model.embed_tokens.weight
+
+    def forward(
+            self,
+            attention_mask: Optional[torch.Tensor]=None,
+            position_ids: Optional[torch.LongTensor]=None,
+            input_embeds: Optional[torch.FloatTensor] =None,
+            kv_cache: Optional[KVCache]=None,
+        )->Tuple:
+        ## input embeds [Batch, seq_len, hidden_size]
+        # output: [Batch, seq_len,hidden_size]
+        outputs=self.model(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            input_embeds=input_embeds,
+            kv_cache=kv_cache,
+        )        
+
+        hidden_states=outputs
+        logits=self.lm_head(hidden_states) ## converting this to the vocab dimension
+        logits=logits.float()
+
+        return_data= {"logits":logits,}
+
+        if kv_cache is not None:
+            return_data["kv_cache"]=kv_cache
+
+        return return_data ## this is what our model will actually output, after generating each tokens probability(will select the argmax during inference)            
+
+
+class PaliGemmaMultiModalProjector(nn.Module):
+    def __init__(self,config:PaliGemmaConfig):
+        super().__init__()
+        self.linear=nn.Linear(config.vision_config.hidden_size,config.vision_config.projection_dim,bias=True)
+
+    def forward(self,image_features):
+        ##[B,num_image_tokens,Embed_dim] --> [B,num_image_tokens,Projection_Dim]
+        hidden_states= self.linear(image_features)    
+        return hidden_states
+    
 
 '''THIS IS THE ACTUAL CLASS WHICH WILL GENERATE THE OUTPUT FROM (<IMAGE><BOS><INPUT_PROMT> TOKENS)'''
 class PaliGemmaForConditionalGeneration(nn.Module): 
