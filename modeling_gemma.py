@@ -6,8 +6,33 @@ import math
 from modeling_siglip import SiglipVisionConfig,SiglipVisionModel
 
 
+class KVCache():
+    def __init__(self) ->None:
+        self.key_cache:List[torch.Tensor]=[] ## key cache would be basically a list of tensors (one for each layer index)
+        self.value_cache:List[torch.Tensor]=[] ## value cache would be basically a list of tensors (one for each layer index)
 
+    def num_items(self)->int:
+        if len(self.key_cache)==0:
+            return 0
+        else:
+            return self.key_cache[0].shape[-2]     ## key cache is [Batch, num_heads_KV,seq_len, head_dim] , 0 is basically the first layer index
 
+    def update(
+            self,
+            key_states:torch.Tensor,
+            value_states:torch.Tensor,
+            layer_idx:int,
+    ) -> Tuple[torch.Tensor,torch.Tensor]:
+        if len(self.key_cache)<=layer_idx: ## this means the KV cache for this layer has not been filled, so lets create it
+            self.key_cache.append(key_states)
+            self.value_cache.append(value_states)
+        else: ## if already exists just concatinate it
+            ## new shape --> [Batch, num_heads_KV,seq_len,head_dim]    
+            self.key_cache[layer_idx]=torch.cat([self.key_cache[layer_idx],key_states],dim=-2)
+            self.value_cache[layer_idx]=torch.cat([self.value_cache[layer_idx],value_states],dim=-2)
+
+            ## return the updated keys and values for that specific layer index
+            return self.key_cache[layer_idx],self.value_cache[layer_idx] 
 
 class GemmaConfig():
     def __init__(self,
@@ -125,6 +150,44 @@ def repeat_kv(hidden_states:torch.Tensor,n_rep:int)->torch.Tensor:
         return hidden_states
     hidden_states=hidden_states[:,:,None,:,:].expand(batch,num_key_value_heads,n_rep,slen,head_dim)  ## matching the number of heads of the query
     return hidden_states.reshape(batch,num_key_value_heads*n_rep,slen,head_dim)
+
+class GemmaMLP(nn.Module):
+    def __init__(self,config:GemmaConfig):
+        super().__init__()
+        self.config=config
+        self.hidden_size=config.hidden_size
+        self.intermediate_size=config.intermediate_size
+        self.gate_proj=nn.Linear(self.hidden_size,self.intermediate_size,bias=False)
+        self.up_proj=nn.Linear(self.hidden_size,self.intermediate_size,bias=False)
+        self.down_proj=nn.Linear(self.intermediate_size,self.hidden_size,bias=False)
+
+    def forward(self,hidden_states:torch.Tensor):
+        ### [Batch,seq_len,hidden_size]  --> [Batch,seq_len,intermediate_size] --> [Batch,seq_len,hidden_size]
+        return self.down_proj(nn.functional.gelu(self.gate_proj(hidden_states),approximate='tanh') * self.up_proj(hidden_states))
+        
+class GemmaRMSNorm(nn.Module):
+    def __init__(self,hidden_size:int,eps):
+        super().__init__()
+        self.eps=eps
+        self.hidden_size=hidden_size ## this is the dimension of the embeddings
+        self.weight=nn.Parameter(torch.zeros(hidden_size))
+
+    def _norm(self,x):
+        return x*torch.rsqrt(x.pow(2).mean(-1,keepdim=True)+self.eps)
+    
+    def forward(self,x):
+        output=self._norm(x.float())
+        ## Llama does x.to(float16) * w, while gamma is (x*w).to(float16)
+        ## See https://github.com/huggingface/transformers/pull/29402
+        output=output*(1+self.weight.float())
+        return output.type_as(x)
+
+    # def forward(self,hidden_states):
+    #     rms_norm=torch.sqrt(hidden_states.pow(2).mean(dim=-1,keepdim=True)+self.eps)
+    #     hidden_states_normalized=(hidden_states/rms_norm)*self.gamma ## [B,seq_len,hidden_size] * [hidden_size] ---> [B,seq_len,hidden_size] * [1,1,hidden_size] ---> [B,seq_len,hidden_size] * [B,seq_len,hidden_size]
+    #     return hidden_states_normalized
+    #     #hidden_states=(torch.rms_norm(hidden_states,eps=self.eps,normalized_shape=hidden_states.shape[-1],elementwise_affine=True))    ## elementwise_affine =True, basically automatically creates the gamma paramater for each embedding vector (2048)
+    #     #return hidden_states 
 
 
 class GemmaAttention(nn.Module):
